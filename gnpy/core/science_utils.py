@@ -6,7 +6,6 @@ from scipy.integrate import solve_bvp
 from scipy.integrate import cumtrapz
 from scipy.interpolate import interp1d
 from scipy.optimize import OptimizeResult
-
 from gnpy.core.utils import db2lin
 from gnpy.core.parameters import SimParams
 
@@ -208,7 +207,10 @@ class RamanSolver:
     @property
     def stimulated_raman_scattering(self):
         if self._stimulated_raman_scattering is None:
-           self.calculate_stimulated_raman_scattering(self.carriers, self.raman_pumps)
+            if self.fiber.params.lumped_losses:
+                self.calculate_stimulated_raman_scattering_losses(self.carriers, self.raman_pumps)
+            else:
+                self.calculate_stimulated_raman_scattering(self.carriers, self.raman_pumps)
         return self._stimulated_raman_scattering
 
     @property
@@ -321,6 +323,50 @@ class RamanSolver:
 
     def calculate_stimulated_raman_scattering(self, carriers, raman_pumps):
         """ Returns stimulated Raman scattering solution including 
+        fiber gain/loss profile.
+        :return: None
+        """
+        # fiber parameters
+        fiber_length = self.fiber.params.length
+        loss_coef = self.fiber.params.lin_loss_exp
+        raman_efficiency = self.fiber.params.raman_efficiency
+        simulation = Simulation.get_simulation()
+        sim_params = simulation.sim_params
+
+        if not sim_params.raman_params.flag_raman:
+            raman_efficiency['cr'] = np.zeros(len(raman_efficiency['cr']))
+        # raman solver parameters
+        z_resolution = sim_params.raman_params.space_resolution
+        tolerance = sim_params.raman_params.tolerance
+
+        logger.debug('Start computing fiber Stimulated Raman Scattering')
+
+        power_spectrum, freq_array, prop_direct, _ = self._compute_power_spectrum(carriers, raman_pumps)
+
+        alphap_fiber = self.fiber.alpha(freq_array)
+
+        freq_diff = abs(freq_array - np.reshape(freq_array, (len(freq_array), 1)))
+        interp_cr = interp1d(raman_efficiency['frequency_offset'], raman_efficiency['cr'])
+        cr = interp_cr(freq_diff)
+
+        # z propagation axis
+        z = np.arange(0, fiber_length + 1, z_resolution)
+
+        ode_function = lambda z, p: self._ode_stimulated_raman(z, p, alphap_fiber, freq_array, cr, prop_direct)
+        boundary_residual = lambda ya, yb: self._residuals_stimulated_raman(ya, yb, power_spectrum, prop_direct)
+        initial_guess_conditions = self._initial_guess_stimulated_raman(z, power_spectrum, alphap_fiber, prop_direct)
+
+        # ODE SOLVER
+        bvp_solution = solve_bvp(ode_function, boundary_residual, z, initial_guess_conditions, tol=tolerance)
+
+        rho = (bvp_solution.y.transpose() / power_spectrum).transpose()
+        rho = np.sqrt(rho)    # From power attenuation to field attenuation
+        stimulated_raman_scattering = StimulatedRamanScattering(freq_array, bvp_solution.x, rho, bvp_solution.y)
+
+        self._stimulated_raman_scattering = stimulated_raman_scattering
+
+    def calculate_stimulated_raman_scattering_losses(self, carriers, raman_pumps):
+        """ Returns stimulated Raman scattering solution including
         fiber gain/loss profile.
         :return: None
         """
